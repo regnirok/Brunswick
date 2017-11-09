@@ -1,0 +1,81 @@
+###VARIABLES###
+
+###ADD SUBSCRIPTION ID FOR TARGET SUBSCRIPTION
+$subguid = "GUID GOES HERE"
+
+###ADD TARGET DATACENTER LOCATION NAME
+$regionname = "North Central US"
+
+###ADD NAME FOR APPLICATION GATEWAY RESOURCE
+$applicationGatewayName = "APP GATEWAY NAME"
+
+###ADD NAME FOR API MANAGEMENT RESOURCE
+$apimname = "NAME OF API MANAGEMENT RESOURCE"
+
+###ADD ORGANIZATION NAME AND ADMIN EMAIL FOR API MANAGEMENT
+$orgname = "Brunswick Corp"
+$adminemail = "someone@brunswick.com"
+
+###ADD PROXY HOSTNAME(EXTERNAL HOSTNAME) FOR API MANAGEMENT
+$proxyhostname = "api.brunswick.com"
+
+###ADD PIP RG AND NAME
+$pipname = "PIP RESOURCE NAME HERE"
+$piprg = "NAME OF PIP RESOURCE GROUP HERE"
+
+###ADD RESOURCE ID FOR TARGET SUBNETS
+$appgatewaysubnetdata = "SUBNET RESOURCE ID"
+$apimsubnetdata = "SUBNET RESOURCE ID"
+
+###ADD NAME FOR RESOURCE GROUP TO CONTAIN API MANAGEMENT AND APP GATEWAY
+$rgname = "NAME OF RESOURCE GROUP"
+
+###ADD LOCAL PATH TO CERTIFICATES AND CERT PASSWORD
+$certpath = "C:\cert\CERTNAME.PFX"
+$certpw = "CERTPASSWORD"
+$certpathCER = "C:\cert\CERTNAME.CER"
+
+###SCRIPT###
+
+#Connect to AzureRM and Subscription
+Login-AzureRmAccount
+Get-AzureRmSubscription -Subscriptionid $subguid | Select-AzureRmSubscription
+
+#Create Resource Group
+#New-AzureRmResourceGroup -Name $rgname -Location $regionname
+
+#Set up API Management Network Obj
+$apimVirtualNetwork = New-AzureRmApiManagementVirtualNetwork -Location $regionname -SubnetResourceId $apimsubnetdata
+$apimService = New-AzureRmApiManagement -ResourceGroupName $rgname -Location $regionname -Name $apimname -Organization $orgname -AdminEmail $adminemail -VirtualNetwork $apimVirtualNetwork -VpnType "Internal" -Sku "Developer"
+
+#set up custom domain
+$certUploadResult = Import-AzureRmApiManagementHostnameCertificate -ResourceGroupName $rgname -Name $apimname -HostnameType "Proxy" -PfxPath $certpath -PfxPassword $certpw -PassThru
+
+#SET UP PROXY HOSTNAME
+$proxyHostnameConfig = New-AzureRmApiManagementHostnameConfiguration -CertificateThumbprint $certUploadResult.Thumbprint -Hostname $proxyhostname
+$result = Set-AzureRmApiManagementHostnames -Name $apimname -ResourceGroupName $rgname -ProxyHostnameConfiguration $proxyHostnameConfig
+
+#CREATE PIP
+$publicip = New-AzureRmPublicIpAddress -ResourceGroupName $piprg -name $pipname -location $regionname -AllocationMethod Dynamic
+
+#Set up App gateway
+$gipconfig = New-AzureRmApplicationGatewayIPConfiguration -Name "gatewayIP01" -Subnet $appgatewaysubnetdata
+$fp01 = New-AzureRmApplicationGatewayFrontendPort -Name "port01"  -Port 443
+$fipconfig01 = New-AzureRmApplicationGatewayFrontendIPConfig -Name "frontend1" -PublicIPAddress $publicip
+$cert = New-AzureRmApplicationGatewaySslCertificate -Name "cert01" -CertificateFile $certpath -Password $certpw
+$listener = New-AzureRmApplicationGatewayHttpListener -Name "listener01" -Protocol "Https" -FrontendIPConfiguration $fipconfig01 -FrontendPort $fp01 -SslCertificate $cert
+$apimprobe = New-AzureRmApplicationGatewayProbeConfig -Name "apimproxyprobe" -Protocol "Https" -HostName "api.contoso.net" -Path "/status-0123456789abcdef" -Interval 30 -Timeout 120 -UnhealthyThreshold 8
+$authcert = New-AzureRmApplicationGatewayAuthenticationCertificate -Name "whitelistcert1" -CertificateFile $certpathCER
+$apimPoolSetting = New-AzureRmApplicationGatewayBackendHttpSettings -Name "apimPoolSetting" -Port 443 -Protocol "Https" -CookieBasedAffinity "Disabled" -Probe $apimprobe -AuthenticationCertificates $authcert -RequestTimeout 180
+$apimProxyBackendPool = New-AzureRmApplicationGatewayBackendAddressPool -Name "apimbackend" -BackendIPAddresses $apimService.StaticIPs[0]
+$dummyBackendSetting = New-AzureRmApplicationGatewayBackendHttpSettings -Name "dummySetting01" -Port 80 -Protocol Http -CookieBasedAffinity Disabled
+$dummyBackendPool = New-AzureRmApplicationGatewayBackendAddressPool -Name "dummyBackendPool" -BackendFqdns "dummybackend.com"
+$dummyPathRule = New-AzureRmApplicationGatewayPathRuleConfig -Name "nonexistentapis" -Paths "/*" -BackendAddressPool $dummyBackendPool -BackendHttpSettings $dummyBackendSetting
+$echoapiRule = New-AzureRmApplicationGatewayPathRuleConfig -Name "externalapis" -Paths "/echo/*" -BackendAddressPool $apimProxyBackendPool -BackendHttpSettings $apimPoolSetting
+$urlPathMap = New-AzureRmApplicationGatewayUrlPathMapConfig -Name "urlpathmap" -PathRules $echoapiRule, $dummyPathRule -DefaultBackendAddressPool $dummyBackendPool -DefaultBackendHttpSettings $dummyBackendSetting
+$rule01 = New-AzureRmApplicationGatewayRequestRoutingRule -Name "rule1" -RuleType PathBasedRouting -HttpListener $listener -UrlPathMap $urlPathMap
+$sku = New-AzureRmApplicationGatewaySku -Name "WAF_Medium" -Tier "WAF" -Capacity 2
+$config = New-AzureRmApplicationGatewayWebApplicationFirewallConfiguration -Enabled $true -FirewallMode "Prevention"
+
+#Deploy App gateway using settings
+$appgw = New-AzureRmApplicationGateway -Name $applicationGatewayName -ResourceGroupName $rgname  -Location $location -BackendAddressPools $apimProxyBackendPool, $dummyBackendPool -BackendHttpSettingsCollection $apimPoolSetting, $dummyBackendSetting  -FrontendIpConfigurations $fipconfig01 -GatewayIpConfigurations $gipconfig -FrontendPorts $fp01 -HttpListeners $listener -UrlPathMaps $urlPathMap -RequestRoutingRules $rule01 -Sku $sku -WebApplicationFirewallConfig $config -SslCertificates $cert -AuthenticationCertificates $authcert -Probes $apimprobe
